@@ -1,0 +1,4 @@
+# Phase 0 (the harness) runs on the Python standard library only — no deps.
+# Pinned tooling lives here so the environment is reproducible.
+
+# Phase 1+ (query/) will add dependencies here as it grows.
