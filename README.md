@@ -274,6 +274,97 @@ entirely.
 
 ---
 
+## Phase 6 — Scale + time compression: when the dump *can't* fit
+
+Phases 1–5 prove the evidence set is *correct* and *small*. Phase 6 proves the
+thing that turns "small" from a nicety into a necessity: **at fleet scale, the
+dump baseline stops being an option at all** — and when it does, the difference
+between CausalLog and "just dump the logs" flips from *efficiency* to
+*capability*.
+
+The setup. We generate a **fleet of independent pool-exhaustion incidents** — many
+copies of the Phase-5 cascade, each on its own pool and its own slice of a
+six-hour timeline (so no two incidents contaminate each other's causal join), then
+stretch time so each incident's root cause sits hours away from its symptom. The
+result is a single log whose total size is several times a real context window.
+
+Then we ask the dump baseline to do the only thing it can do when the log doesn't
+fit: **truncate to fit.** And we give it the *smartest* truncations, not a
+strawman — the two an actual log tool would use:
+
+- **recency** — keep the most recent tokens (what `tail` does), drop the old ones.
+- **head/tail** — keep both ends, drop the middle.
+
+For each strategy we measure **holder-recall**: of the three true cross-request
+holders, how many survive into what the LLM would actually receive? (If a holder's
+line got truncated away, no LLM could ever name it — the evidence is gone before
+reasoning begins. So this is the *ceiling* on any downstream diagnosis.)
+
+The honesty guard, asserted on every run: the full dump must exceed the window
+(otherwise there's nothing to prove), and the operators' evidence must fit
+(otherwise the contrast is fake).
+
+### The result — the dump fails *across the fleet*; the operators don't
+
+We don't report a single number, because a single incident invites "you picked a
+good one." We **sweep every incident** and report holder-recall by position. At a
+fleet 4x the size of a 128,000-token window (real `tiktoken` counts, verified on
+*both* DuckDB and ClickHouse):
+
+```
+              holder-recall (mean over 330 incidents)
+recency            0.25
+head/tail          0.25
+trace_cause        1.00
+drill_down         1.00
+```
+
+And the *shape* is the real story. Plotted by incident position:
+
+- **recency** recovers only the *recent* incidents and loses everything older — a
+  ramp from 0 up to 1.
+- **head/tail** recovers only the *ends* and loses the entire middle — a valley.
+- the two cuts fail on **disjoint** regions: there is no fixed-window truncation
+  that recovers the fleet.
+- **the operators are flat at 1.00 across every position** — they never truncate
+  by time; they walk the causal graph to the holders wherever (and whenever) they
+  are, at ~1,000 tokens per incident against a ~500,000-token dump.
+
+### Why this is *capability*, not efficiency — and the trend that proves it
+
+The 0.25 is not a fixed fact; it's a **function of scale.** As we grow the fleet
+relative to the window, the dump can hold a smaller and smaller fraction of it:
+
+```
+dump size vs window     dump holder-recall     operator holder-recall
+   1.4x                      0.69                     1.00
+   2.9x                      0.34                     1.00
+   4.0x                      0.25                     1.00
+```
+
+The dump's recall falls toward zero as the system grows; the causal index is
+**invariant to scale.** That trend *is* the capability argument: a structureless
+dump cannot reliably hold a long-horizon, cross-request cause once the log
+outgrows the window — it succeeds only by the luck of where the cause happens to
+sit — while CausalLog finds it every time, at constant size, no matter how large
+the fleet gets.
+
+> **The honest framing.** This runs on *synthetic, uniform* incidents, so it is a
+> proof of **mechanism at scale**, not yet a result on messy production logs (that
+> is Phase 8). And the defensible claim is the **shape**, not the exact 0.25:
+> operators flat at 1.0 regardless of position and scale, while *any* fixed-window
+> truncation's recall depends on where the cause sits and degrades without bound
+> as the fleet grows. Verified identically on DuckDB (in-process) and ClickHouse
+> (production columnar engine) — same SQL semantics, same numbers.
+
+**Result:** a per-incident recall sweep and a scale curve showing the dump
+baseline collapsing toward zero recall as the fleet grows past the context window,
+while the causal operators stay at 1.0 holder-recall at a constant ~1k tokens —
+the point where bounded evidence stops being an optimization and becomes the only
+thing that works.
+
+---
+
 ## Where things stand
 
 | Phase | What it adds | Status |
@@ -284,18 +375,21 @@ entirely.
 | 3 | `SUSTAINED_DRIFT` — find the symptom with no label | done — tuned to ~0% false positives |
 | 4 | `DRILL_DOWN` + ClickHouse — bounded, context-rich evidence | done — ~100x token reduction |
 | 5 | Cross-request causality — faults across requests | done — both scores 1.0 |
-| 6 | Scale + time compression (exceed a context window) | next |
-| 7 | The showdown — real LLM, pruned evidence vs. full dump | — |
+| 6 | Scale + time compression (exceed a context window) | done — dump recall -> 0.25 at 4x, operators 1.0; verified DuckDB + ClickHouse |
+| 7 | The showdown — real LLM, pruned evidence vs. full dump | next |
 | 8 | External benchmarks (DeathStarBench / Train-Ticket) | — |
 
-**A note on "where's the LLM?"** — by design, there isn't one yet. Phases 0–5
+**A note on "where's the LLM?"** — by design, there isn't one yet. Phases 0–6
 build and *prove* the retrieval layer: that the evidence set is correct
-(precision/recall) and bounded (tokens). None of that needs a live model to
-verify. The LLM enters in **Phase 7**, the showdown: feed a real model *both* the
-pruned evidence and the full dump, and measure which one lets it actually fix the
-bug. That's where "a query layer for LLMs to parse" gets its final proof. We built
-the pruner first because you can't test "does pruning help the LLM" until you have
-the pruning.
+(precision/recall), bounded (tokens), and that at scale the bounded set is the
+*only* thing that fits (Phase 6's recall ceiling). None of that needs a live model
+to verify. The LLM enters in **Phase 7**, the showdown: feed a real model *both*
+the pruned evidence and the (necessarily truncated) dump, and measure which one
+lets it actually fix the bug. Phase 6 establishes the ceiling — the dump usually
+doesn't even *contain* the answer; Phase 7 measures how close to that ceiling each
+approach gets once a real model reasons over what survived. We built the pruner
+first because you can't test "does pruning help the LLM" until you have the
+pruning.
 
 ---
 
@@ -316,6 +410,9 @@ the pruning.
 5. **Read causality, don't guess it.** Cross-request links come from instrumented
    pool events joined on ID and time — deterministic — not from statistical
    inference, which is where prior systems get fragile.
+6. **At scale, bounded isn't an optimization — it's the only thing that fits.**
+   Phase 6's point in one line: the dump's recall is a function of where the cause
+   sits and how big the fleet is; the causal index's recall is invariant to both.
 
 ---
 
@@ -341,9 +438,24 @@ python cascade.py                   # generate the pool-exhaustion cascade
 cd ../query
 python cascade_scorer.py            # full-chain + holder-ID scores
 
-# 4. optional: real ClickHouse backend
+# 4. the scale / time-compression result (Phase 6)
+cd ../harness
+rm -f ../data/logs.jsonl ../data/ground_truth.jsonl
+python cascade_fleet.py --n 330                 # a fleet of disjoint incidents
+python time_stretch.py --mode gap --span-hours 6 \
+  --in ../data/logs.jsonl --out ../data/logs_stretched.jsonl
+cd ../query
+# per-incident recall sweep (the distribution result); window = a real context window
+python phase6_scale.py --logs ../data/logs_stretched.jsonl \
+  --gt ../data/ground_truth.jsonl --window 128000 --store duckdb --sweep
+
+# 5. optional: the same Phase 6 sweep on the real ClickHouse backend
 ./clickhouse_setup.sh
-python clickhouse_load.py ../data/logs.jsonl
+# wipe any stale rows first, then load only the current fleet:
+curl -s 'http://localhost:8123/?password=causallog' --data-binary 'TRUNCATE TABLE causallog.logs'
+python clickhouse_load.py ../data/logs_stretched.jsonl
+python phase6_scale.py --logs ../data/logs_stretched.jsonl \
+  --gt ../data/ground_truth.jsonl --window 128000 --store clickhouse --sweep
 ```
 
 ---
