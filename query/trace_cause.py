@@ -54,3 +54,42 @@ def find_symptom(trace_records: list[dict]) -> Optional[str]:
         if r["event_type"] == "FAULT_INJECTED":
             return r["span_id"]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: TRACE_CAUSE as a GRAPH WALK.
+#
+# The linear trace_cause() above assumes one predecessor per span (the parent).
+# Cross-request causality breaks that: a pool-timeout victim has MANY predecessors
+# (the holders). So the general operator is a graph traversal over a
+# CausalLinkProvider, which yields predecessors of ANY edge type (parent OR pool).
+#
+# On a within-trace-only fault, the provider returns only parent edges, so this
+# degenerates to EXACTLY the linear chain above — same input, same output. The
+# graph walk is a strict generalization, not a replacement.
+#
+# Cycle guard: a `visited` set is mandatory. Deadlock faults (A waits on B's pool,
+# B waits on A's pool) form causal CYCLES; without visited, the walk loops forever.
+# ---------------------------------------------------------------------------
+
+def trace_cause_graph(symptom_span_id, provider) -> list[str]:
+    """
+    Walk the causal graph backward from the symptom, collecting all reachable
+    cause spans. `provider` is a CausalLinkProvider: predecessors(span) -> list.
+
+    BFS with a visited set (cycle-safe). Returns spans in discovery order with the
+    symptom first. On a single-parent graph this reproduces the linear chain.
+    """
+    visited = {symptom_span_id}
+    order = [symptom_span_id]
+    queue = [symptom_span_id]
+
+    while queue:
+        current = queue.pop(0)
+        for pred in provider.predecessors(current):
+            if pred not in visited:        # cycle guard + dedup
+                visited.add(pred)
+                order.append(pred)
+                queue.append(pred)
+
+    return order
